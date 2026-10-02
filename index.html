@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planning Poker</title>
+<style>
+:root{--bg:#f3f5f2;--fg:#1d2a24;--mut:#667269;--card:#fff;--line:#d5dcd6;--acc:#1f6f54;--accfg:#fff;--back:#2b3d6b}
+@media (prefers-color-scheme:dark){:root{--bg:#141a17;--fg:#e8efe9;--mut:#93a097;--card:#1e2723;--line:#33403a;--acc:#4cc59a;--accfg:#08140f;--back:#4d63a3}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 Georgia,'Times New Roman',serif}
+main{max-width:860px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:1.5rem;margin:0}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:24px}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid var(--line);background:var(--card);border-radius:8px;padding:8px 14px}
+button.primary{background:var(--acc);color:var(--accfg);border-color:var(--acc)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+input{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:9px 12px;width:100%}
+.hidden{display:none!important}
+#join{max-width:360px;margin:12vh auto;display:grid;gap:12px}
+.mut{color:var(--mut);font-size:.9rem}
+#table{display:flex;flex-wrap:wrap;gap:14px;margin:20px 0;min-height:130px}
+.seat{width:84px;text-align:center}
+.pcard{height:116px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:2rem;border:2px dashed var(--line)}
+.pcard.voted{background:var(--back);border:2px solid var(--back);color:#fff}
+.pcard.shown{background:var(--card);color:var(--fg);border:2px solid var(--acc)}
+.seat .n{margin-top:6px;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seat.me .n{font-weight:bold}
+#actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+#stats{display:flex;gap:22px;flex-wrap:wrap;margin:18px 0;padding:14px 16px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+#stats b{font-size:1.5rem;display:block}
+#stats.consensus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+#deck{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}
+#deck button{width:58px;height:84px;font-size:1.3rem;border-radius:10px}
+#deck button[aria-pressed=true]{background:var(--acc);color:var(--accfg);border-color:var(--acc);transform:translateY(-8px)}
+#deck button:disabled{opacity:.5;cursor:default}
+</style>
+</head>
+<body>
+<main>
+  <section id="join" class="hidden">
+    <h1>Planning Poker</h1>
+    <p class="mut">Room <code id="joinRoom"></code>. Enter a name or pseudonym to join.</p>
+    <input id="nameIn" placeholder="Your name" maxlength="24" autocomplete="nickname">
+    <button class="primary" id="joinBtn">Join room</button>
+    <button id="newRoomBtn">Start a new room instead</button>
+  </section>
+
+  <section id="app" class="hidden">
+    <header>
+      <div><h1>Planning Poker</h1><div class="mut" id="status"></div></div>
+      <button id="copy">Copy invite link</button>
+    </header>
+    <div id="table"></div>
+    <div id="actions">
+      <button class="primary" id="reveal">Reveal votes</button>
+      <button id="reset">New round</button>
+      <span class="mut" id="progress"></span>
+    </div>
+    <div id="stats" class="hidden"></div>
+    <div id="deck" role="group" aria-label="Your vote"></div>
+  </section>
+</main>
+
+<script type="module">
+// Pinned version. If you upgrade, check the Trystero release notes for API changes.
+import {joinRoom, selfId} from 'https://cdn.jsdelivr.net/npm/trystero@0.21.5/+esm';
+
+// Change this to a string unique to your site so you don't mix with other Trystero apps.
+const APP_ID = 'github-pages-planning-poker-v1';
+const DECK = ['0','1','2','3','5','8','13','21','?','☕'];
+const $ = id => document.getElementById(id);
+
+let room, sendState, name = '', myVote = null, revealed = false, round = 0;
+const peers = {}; // id -> {name, voted, revealed, value}
+
+function roomId() {
+  let id = location.hash.slice(1);
+  if (!id) { id = crypto.randomUUID().slice(0, 8); location.hash = id; }
+  return id;
+}
+
+// ---- Join flow ----
+function showJoin() {
+  $('joinRoom').textContent = roomId();
+  $('nameIn').value = localStorage.getItem('pp-name') || '';
+  $('join').classList.remove('hidden');
+  $('app').classList.add('hidden');
+}
+$('joinBtn').onclick = () => {
+  const n = $('nameIn').value.trim();
+  if (!n) { $('nameIn').focus(); return; }
+  localStorage.setItem('pp-name', n);
+  name = n;
+  start();
+};
+$('nameIn').onkeydown = e => { if (e.key === 'Enter') $('joinBtn').click(); };
+$('newRoomBtn').onclick = () => { location.hash = crypto.randomUUID().slice(0, 8); location.reload(); };
+window.onhashchange = () => location.reload();
+
+// ---- Realtime ----
+function myState() {
+  return {name, voted: myVote !== null, revealed, round, value: revealed ? myVote : null};
+}
+function broadcast(to) { sendState(myState(), to); render(); }
+
+function start() {
+  $('join').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  room = joinRoom({appId: APP_ID}, roomId());
+  const [send, onState] = room.makeAction('state');
+  sendState = send;
+
+  room.onPeerJoin(id => { peers[id] = {name: '…', voted: false}; sendState(myState(), id); render(); });
+  room.onPeerLeave(id => { delete peers[id]; render(); });
+
+  onState((s, id) => {
+    peers[id] = s;
+    let changed = false;
+    if (s.round > round) {          // someone started a newer round (or we joined late)
+      round = s.round; revealed = s.revealed;
+      if (!revealed || s.round > 0) myVote = null;
+      changed = true;
+    } else if (s.round === round && s.revealed && !revealed) {
+      revealed = true; changed = true;   // someone revealed: show ours too
+    }
+    if (changed) broadcast(); else render();
+  });
+
+  buildDeck();
+  render();
+}
+
+// ---- Actions ----
+$('reveal').onclick = () => { revealed = true; broadcast(); };
+$('reset').onclick = () => { round++; revealed = false; myVote = null; broadcast(); };
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); $('copy').textContent = 'Link copied'; }
+  catch { prompt('Copy this link:', location.href); }
+  setTimeout(() => $('copy').textContent = 'Copy invite link', 1800);
+};
+
+function buildDeck() {
+  $('deck').innerHTML = '';
+  DECK.forEach(v => {
+    const b = document.createElement('button');
+    b.textContent = v; b.dataset.v = v; b.setAttribute('aria-pressed', 'false');
+    b.onclick = () => { myVote = myVote === v ? null : v; broadcast(); };
+    $('deck').appendChild(b);
+  });
+}
+
+// ---- Rendering ----
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function render() {
+  const all = [{id: selfId, me: true, ...myState()}, ...Object.entries(peers).map(([id, p]) => ({id, ...p}))];
+  $('table').innerHTML = all.map(p => {
+    const shown = revealed && p.revealed && p.value != null;
+    const cls = shown ? 'shown' : p.voted ? 'voted' : '';
+    return `<div class="seat ${p.me ? 'me' : ''}"><div class="pcard ${cls}">${shown ? esc(p.value) : ''}</div><div class="n">${esc(p.name || '')}${p.me ? ' (you)' : ''}</div></div>`;
+  }).join('');
+
+  const voted = all.filter(p => p.voted).length;
+  $('status').textContent = `Room ${roomId()} · ${all.length} ${all.length === 1 ? 'person' : 'people'} here`;
+  $('progress').textContent = revealed ? '' : `${voted} of ${all.length} voted`;
+  document.querySelectorAll('#deck button').forEach(b => {
+    b.setAttribute('aria-pressed', String(b.dataset.v === myVote));
+    b.disabled = revealed;
+  });
+
+  const stats = $('stats');
+  if (!revealed) { stats.classList.add('hidden'); return; }
+  const vals = all.filter(p => p.value != null).map(p => p.value);
+  const nums = vals.map(Number).filter(n => !isNaN(n) && vals.length).sort((a, b) => a - b);
+  stats.classList.remove('hidden');
+  if (!nums.length) { stats.className = ''; stats.innerHTML = '<span class="mut">No numeric votes.</span>'; return; }
+  const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
+  const mid = nums.length >> 1;
+  const med = nums.length % 2 ? nums[mid] : (nums[mid - 1] + nums[mid]) / 2;
+  const agree = vals.length > 1 && vals.every(v => v === vals[0]);
+  stats.className = agree ? 'consensus' : '';
+  stats.innerHTML = `<div><b>${avg.toFixed(1)}</b>Average</div><div><b>${med}</b>Median</div>` +
+    `<div><b>${nums[0]}</b>Lowest</div><div><b>${nums[nums.length - 1]}</b>Highest</div>` +
+    (agree ? '<div><b>✓</b>Consensus</div>' : '');
+}
+
+// ---- Boot ----
+roomId();
+const saved = localStorage.getItem('pp-name');
+if (saved && location.hash) { name = saved; start(); } else showJoin();
+</script>
+</body>
+</html>
